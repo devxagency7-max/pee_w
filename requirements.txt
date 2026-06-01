@@ -1,0 +1,6 @@
+torch
+torchvision
+ultralytics
+huggingface_hub
+opencv-python
+numpy

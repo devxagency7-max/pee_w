@@ -21,11 +21,14 @@ Accuracy │ imgsz=1280 · conf=0.35 · multi-frame voting (3-frame buffer)
 
 import os
 import sys
+import io
+import queue
 import cv2
 import time
 import threading
 import torch
 import numpy as np
+import requests
 from ultralytics import YOLO
 from datetime import datetime
 from collections import deque
@@ -266,10 +269,54 @@ class ViolationVoter:
         return confirmed_h, confirmed_v, confirmed_g, confirmed_gl, confirmed_m
 
 # ================================================================
+#  PERSON TRACKER — assigns persistent IDs across frames
+# ================================================================
+class PersonTracker:
+    def __init__(self, iou_threshold=0.35, max_lost=10):
+        self.next_id       = 1
+        self.tracks        = {}   # id -> {"box": [...], "lost": int}
+        self.iou_threshold = iou_threshold
+        self.max_lost      = max_lost
+
+    def update(self, person_boxes):
+        """person_boxes: list of [x1,y1,x2,y2]. Returns list of IDs (same order)."""
+        result_ids  = []
+        used_tracks = set()
+
+        for box in person_boxes:
+            best_iou, best_id = 0.0, None
+            for tid, t in self.tracks.items():
+                if tid in used_tracks:
+                    continue
+                iou = _iou(box, t["box"])
+                if iou > best_iou:
+                    best_iou, best_id = iou, tid
+
+            if best_iou >= self.iou_threshold:
+                used_tracks.add(best_id)
+                self.tracks[best_id]["box"]  = box
+                self.tracks[best_id]["lost"] = 0
+                result_ids.append(best_id)
+            else:
+                new_id = self.next_id
+                self.next_id += 1
+                self.tracks[new_id] = {"box": box, "lost": 0}
+                used_tracks.add(new_id)
+                result_ids.append(new_id)
+
+        # Age-out unmatched tracks
+        for tid in list(self.tracks):
+            if tid not in used_tracks:
+                self.tracks[tid]["lost"] += 1
+                if self.tracks[tid]["lost"] > self.max_lost:
+                    del self.tracks[tid]
+
+        return result_ids
+
+# ================================================================
 #  VIOLATION LOGIC — works on unified detection list
 # ================================================================
-def check_violations(dets):
-    # Only evaluate violations on persons detected with robust confidence >= 0.55
+def check_violations(dets, person_ids=None):
     persons    = [d for d in dets if d["key"]=="person" and d["conf"] >= 0.55]
     helmets    = [d for d in dets if d["key"]=="helmet"]
     vests      = [d for d in dets if d["key"]=="vest"]
@@ -285,8 +332,12 @@ def check_violations(dets):
     v_gl = False
     v_m = False
 
-    for p in persons:
-        pb = p["box"]
+    persons_data = []
+
+    for idx, p in enumerate(persons):
+        pb  = p["box"]
+        pid = person_ids[idx] if (person_ids and idx < len(person_ids)) else idx + 1
+
         has_helmet  = any(on_person(pb, h["box"]) for h in helmets)
         has_vest    = any(on_person(pb, v["box"]) for v in vests)
         has_no_h    = any(on_person(pb, n["box"]) for n in no_helmets)
@@ -295,81 +346,70 @@ def check_violations(dets):
         has_glasses = any(on_person(pb, gl["box"]) for gl in glasses)
         has_mask    = any(on_person(pb, m["box"]) for m in masks)
 
-        if has_no_h or not has_helmet: v_h = True
-        if has_no_v or not has_vest:   v_v = True
-        if not has_gloves:             v_g = True
-        
+        p_missing = []
+        if has_no_h or not has_helmet:
+            v_h = True
+            p_missing.append("helmet")
+        if has_no_v or not has_vest:
+            v_v = True
+            p_missing.append("vest")
+        if not has_gloves:
+            v_g = True
+            p_missing.append("gloves")
+
         # Estimate head/face based on helmet if present, else estimate from person box
         associated_helmets = [h for h in helmets if on_person(pb, h["box"])]
-        
+
         if associated_helmets:
-            # We have a high-precision helmet box on the head!
             h_box = associated_helmets[0]["box"]
             hx1, hy1, hx2, hy2 = h_box
             h_h = hy2 - hy1
             h_w = hx2 - hx1
-            
-            # Glasses should be right below the helmet (eyes region)
             gl_x1 = max(0.0, hx1 + h_w * 0.1)
             gl_y1 = max(0.0, hy2 - h_h * 0.1)
             gl_x2 = max(0.0, hx2 - h_w * 0.1)
             gl_y2 = max(0.0, hy2 + h_h * 0.4)
-            
-            # Mask should be below the glasses (mouth & nose region)
-            m_x1 = max(0.0, hx1 + h_w * 0.15)
-            m_y1 = max(0.0, hy2 + h_h * 0.35)
-            m_x2 = max(0.0, hx2 - h_w * 0.15)
-            m_y2 = max(0.0, hy2 + h_h * 1.0)
+            m_x1  = max(0.0, hx1 + h_w * 0.15)
+            m_y1  = max(0.0, hy2 + h_h * 0.35)
+            m_x2  = max(0.0, hx2 - h_w * 0.15)
+            m_y2  = max(0.0, hy2 + h_h * 1.0)
         else:
-            # No helmet, estimate head from person box width to remain invariant to vertical cropping
             px1, py1, px2, py2 = pb
             pw = px2 - px1
-            ph = py2 - py1
-            
-            # Estimate head dimensions based on width
             hw = pw * 0.45
             hh = hw * 1.2
             center_x = px1 + pw / 2.0
-            
-            # Head bounding box
             hx1 = max(px1, center_x - hw / 2.0)
             hy1 = py1
             hx2 = min(px2, center_x + hw / 2.0)
             hy2 = min(py2, py1 + hh)
-            
-            # Eyes / Glasses (middle-upper part of the head box)
             gl_x1 = max(0.0, hx1 + (hx2 - hx1) * 0.1)
             gl_y1 = max(0.0, hy1 + (hy2 - hy1) * 0.25)
             gl_x2 = max(0.0, hx2 - (hx2 - hx1) * 0.1)
             gl_y2 = max(0.0, hy1 + (hy2 - hy1) * 0.55)
-            
-            # Mouth & Nose / Mask (middle-lower part of the head box)
-            m_x1 = max(0.0, hx1 + (hx2 - hx1) * 0.15)
-            m_y1 = max(0.0, hy1 + (hy2 - hy1) * 0.50)
-            m_x2 = max(0.0, hx2 - (hx2 - hx1) * 0.15)
-            m_y2 = max(0.0, hy1 + (hy2 - hy1) * 0.95)
+            m_x1  = max(0.0, hx1 + (hx2 - hx1) * 0.15)
+            m_y1  = max(0.0, hy1 + (hy2 - hy1) * 0.50)
+            m_x2  = max(0.0, hx2 - (hx2 - hx1) * 0.15)
+            m_y2  = max(0.0, hy1 + (hy2 - hy1) * 0.95)
 
         if not has_glasses:
             v_gl = True
-            # Add virtual red box for missing glasses on face
-            dets.append({
-                "key": "no_glasses",
-                "box": [gl_x1, gl_y1, gl_x2, gl_y2],
-                "conf": 1.0,
-                "priority": 3
-            })
-            
+            p_missing.append("glasses")
+            dets.append({"key": "no_glasses", "box": [gl_x1, gl_y1, gl_x2, gl_y2], "conf": 1.0, "priority": 3})
+
         if not has_mask:
             v_m = True
-            # Add virtual red box for missing mask on mouth/chin region
-            dets.append({
-                "key": "no_mask",
-                "box": [m_x1, m_y1, m_x2, m_y2],
-                "conf": 1.0,
-                "priority": 3
-            })
+            p_missing.append("mask")
+            dets.append({"key": "no_mask", "box": [m_x1, m_y1, m_x2, m_y2], "conf": 1.0, "priority": 3})
 
-    return v_h, v_v, v_g, v_gl, v_m, len(persons)
+        persons_data.append({
+            "person_id": pid,
+            "box":       pb,
+            "conf":      p["conf"],
+            "missing":   p_missing,
+        })
+
+    return v_h, v_v, v_g, v_gl, v_m, len(persons), persons_data
 
 # ================================================================
 #  ANNOTATION — single clean layer from fused detections
@@ -414,6 +454,41 @@ def draw_status(width, v_h, v_v, v_g, v_gl, v_m, fps, persons):
     cv2.putText(bar, f"FPS {fps:>3}", (width-130,40),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.72, (200,200,200), 2)
     return bar
+
+# ================================================================
+#  API — send violation image to backend
+# ================================================================
+API_URL       = "http://127.0.0.1:8000/api/vehicle-log"
+CAMERA_NUMBER = 1
+
+_api_queue = queue.Queue(maxsize=100)
+
+def send_violation_api(frame, violation_type: str, extra: dict = None):
+    try:
+        _, buf = cv2.imencode(".jpg", frame)
+        img_bytes = io.BytesIO(buf.tobytes())
+        data = {"number_camera": CAMERA_NUMBER, "type": violation_type}
+        if extra:
+            data.update(extra)
+        response = requests.post(
+            API_URL,
+            files={"image": ("violation.jpg", img_bytes, "image/jpeg")},
+            data=data,
+            timeout=5,
+        )
+        pid = data.get("person_id", "?")
+        print(f"[API] {violation_type} | person={pid} → {response.status_code}")
+    except Exception as exc:
+        print(f"[API] Failed ({violation_type}): {exc}")
+
+def _api_worker():
+    while True:
+        item = _api_queue.get()
+        if item is None:
+            break
+        frame, vtype, extra = item
+        send_violation_api(frame, vtype, extra)
+        _api_queue.task_done()
 
 # ================================================================
 #  CAMERA CAPTURE THREAD — reads at full 30fps, always fresh
@@ -466,28 +541,30 @@ class CameraCapture(threading.Thread):
 class InferenceEngine(threading.Thread):
     def __init__(self, model1, model2, device, camera: CameraCapture):
         super().__init__(daemon=True)
-        self.m1       = model1
-        self.m2       = model2
-        self.device   = device
-        self.camera   = camera
-        self.smoother = Smoother()
-        self.voter    = ViolationVoter()
-        self._lock    = threading.Lock()
-        self._stop    = threading.Event()
-        # shared result (lock-protected)
-        self._dets    = []
-        self._v_h     = False
-        self._v_v     = False
-        self._v_g     = False
-        self._v_gl    = False
-        self._v_m     = False
-        self._persons = 0
+        self.m1             = model1
+        self.m2             = model2
+        self.device         = device
+        self.camera         = camera
+        self.smoother       = Smoother()
+        self.voter          = ViolationVoter()
+        self.person_tracker = PersonTracker()
+        self._lock          = threading.Lock()
+        self._stop          = threading.Event()
+        self._dets          = []
+        self._v_h           = False
+        self._v_v           = False
+        self._v_g           = False
+        self._v_gl          = False
+        self._v_m           = False
+        self._persons       = 0
+        self._persons_data  = []
 
     def stop(self): self._stop.set()
 
     def result(self):
         with self._lock:
-            return self._dets, self._v_h, self._v_v, self._v_g, self._v_gl, self._v_m, self._persons
+            return (self._dets, self._v_h, self._v_v, self._v_g,
+                    self._v_gl, self._v_m, self._persons, self._persons_data)
 
     def run(self):
         while not self._stop.is_set():
@@ -506,17 +583,21 @@ class InferenceEngine(threading.Thread):
             fused    = fuse(r1, r2)
             smoothed = self.smoother.update(fused)
 
-            raw_h, raw_v, raw_g, raw_gl, raw_m, persons = check_violations(smoothed)
-            voted_h, voted_v, voted_g, voted_gl, voted_m  = self.voter.update(raw_h, raw_v, raw_g, raw_gl, raw_m)
+            person_boxes = [d["box"] for d in smoothed if d["key"] == "person" and d["conf"] >= 0.55]
+            person_ids   = self.person_tracker.update(person_boxes)
+
+            raw_h, raw_v, raw_g, raw_gl, raw_m, persons, persons_data = check_violations(smoothed, person_ids)
+            voted_h, voted_v, voted_g, voted_gl, voted_m = self.voter.update(raw_h, raw_v, raw_g, raw_gl, raw_m)
 
             with self._lock:
-                self._dets    = smoothed
-                self._v_h     = voted_h
-                self._v_v     = voted_v
-                self._v_g     = voted_g
-                self._v_gl    = voted_gl
-                self._v_m     = voted_m
-                self._persons = persons
+                self._dets         = smoothed
+                self._v_h          = voted_h
+                self._v_v          = voted_v
+                self._v_g          = voted_g
+                self._v_gl         = voted_gl
+                self._v_m          = voted_m
+                self._persons      = persons
+                self._persons_data = persons_data
 
 # ================================================================
 #  MAIN
@@ -576,21 +657,31 @@ def main():
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
-    last_alert = 0
-    prev_time  = time.time()
+    # Start API worker thread
+    api_thread = threading.Thread(target=_api_worker, daemon=True)
+    api_thread.start()
+
+    last_alert      = 0
+    person_alert_ts = {}   # person_id -> last API send time
+    prev_time       = time.time()
 
     print("Running — press 'q' quit | 's' save snapshot")
 
     while True:
-        # always use the live camera frame — never the processed one
         frame = camera.frame
         if frame is None:
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
             continue
 
-        dets, v_h, v_v, v_g, v_gl, v_m, persons = engine.result()
+        dets, v_h, v_v, v_g, v_gl, v_m, persons, persons_data = engine.result()
         annotated = annotate(frame, dets)
+
+        # Draw person ID label on each tracked person
+        for pd in persons_data:
+            x1, y1 = int(pd["box"][0]), int(pd["box"][1])
+            cv2.putText(annotated, f"P{pd['person_id']}", (x1 + 4, y1 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
 
         now  = time.time()
         fps  = int(1 / max(now - prev_time, 1e-6))
@@ -600,20 +691,50 @@ def main():
         bar  = draw_status(w, v_h, v_v, v_g, v_gl, v_m, fps, persons)
         out  = np.vstack([bar, annotated])
 
-        # Auto-save on confirmed violation
+        # Auto-save scene snapshot on any confirmed violation (global cooldown)
         if (v_h or v_v or v_g or v_gl or v_m) and (now - last_alert) > ALERT_COOLDOWN:
             last_alert = now
             ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
             parts = []
-            if v_h: parts.append("helmet")
-            if v_v: parts.append("vest")
-            if v_g: parts.append("gloves")
+            if v_h:  parts.append("helmet")
+            if v_v:  parts.append("vest")
+            if v_g:  parts.append("gloves")
             if v_gl: parts.append("glasses")
-            if v_m: parts.append("mask")
+            if v_m:  parts.append("mask")
             vtype = "_".join(parts)
             path  = os.path.join(VIOLATIONS_DIR, f"{vtype}_{ts}.jpg")
             cv2.imwrite(path, out)
             print(f"[{ts}] VIOLATION — {vtype.replace('_',' ').upper()} | {path}")
+
+        # Per-person API alerts (helmet + vest only, each person has own cooldown)
+        active_ids = set()
+        for pd in persons_data:
+            pid     = pd["person_id"]
+            missing = pd["missing"]
+            active_ids.add(pid)
+            last_ts = person_alert_ts.get(pid, 0)
+
+            if (now - last_ts) > ALERT_COOLDOWN and ("helmet" in missing or "vest" in missing):
+                person_alert_ts[pid] = now
+                bbox_str = "{},{},{},{}".format(
+                    int(pd["box"][0]), int(pd["box"][1]),
+                    int(pd["box"][2]), int(pd["box"][3])
+                )
+                for vtype in ("helmet", "vest"):
+                    if vtype in missing:
+                        extra = {
+                            "person_id":   pid,
+                            "confidence":  round(pd["conf"], 3),
+                            "bbox":        bbox_str,
+                            "also_missing": ",".join(m for m in missing if m != vtype),
+                        }
+                        try:
+                            _api_queue.put_nowait((out, vtype, extra))
+                        except queue.Full:
+                            print("[API] Queue full — dropping violation")
+
+        # Clean up cooldown entries for persons who left the frame
+        person_alert_ts = {k: v for k, v in person_alert_ts.items() if k in active_ids}
 
         cv2.imshow(win, out)
         key = cv2.waitKey(1) & 0xFF
@@ -627,6 +748,7 @@ def main():
 
     engine.stop()
     camera.stop()
+    _api_queue.put(None)   # signal worker to exit
     engine.join(timeout=2)
     camera.join(timeout=2)
     cap.release()
